@@ -838,9 +838,258 @@ def add_product_to_cart(driver, row):
     return True, "Tillagd i kundvagn"
 
 
+def _safe_click_by_text(driver, texts):
+    """Click the first visible button/link whose text contains one of texts."""
+    for text in texts:
+        xpath = (
+            "//*[self::button or self::a or @role='button' or @role='tab']["
+            "contains(translate(normalize-space(.),"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),"
+            f"'{text.lower()}')]"
+        )
+        elements = visible_elements(driver, xpath)
+        if click_first(driver, elements):
+            return True
+    return False
+
+
+def _element_is_enabled(element):
+    try:
+        if not element.is_enabled():
+            return False
+        if element.get_attribute("disabled") is not None:
+            return False
+        if (element.get_attribute("aria-disabled") or "").lower() == "true":
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def choose_pickup_location_if_needed(driver):
+    """Handle ICA's 'Välj utlämningsställe' dialog if it appears."""
+    text = fold_text(page_text(driver))
+    if "valj utlamningsstalle" not in text and "valj den har platsen" not in text:
+        return False
+
+    buttons = visible_elements(
+        driver,
+        "//*[self::button or self::a][contains(translate(normalize-space(.),"
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),"
+        "'välj den här platsen')]",
+    )
+    if click_first(driver, buttons):
+        print("         🚗 Valde utlämningsställe")
+        time.sleep(1.0)
+        return True
+    return False
+
+
+def choose_pickup_tab(driver):
+    """Choose 'Hämta' instead of home delivery on the delivery-time page."""
+    # Prefer actual tabs/buttons, not arbitrary text nodes.
+    xpath = (
+        "//*[self::button or self::a or @role='tab']["
+        "translate(normalize-space(.),"
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö')='hämta']"
+    )
+    elements = visible_elements(driver, xpath)
+    if click_first(driver, elements):
+        print("         🚗 Valde Hämta")
+        time.sleep(0.8)
+        return True
+
+    # Fallback for ICA components that render the tab as another clickable element.
+    try:
+        elements = driver.find_elements(
+            By.XPATH,
+            "//*[translate(normalize-space(.),"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö')='hämta']",
+        )
+        for el in elements:
+            if not el.is_displayed():
+                continue
+            try:
+                driver.execute_script("arguments[0].click();", el)
+                print("         🚗 Valde Hämta")
+                time.sleep(0.8)
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def choose_first_available_pickup_slot(driver):
+    """Choose the first enabled pickup time (the white '0 kr' cells in ICA)."""
+    # First try actual buttons containing exactly 0 kr.
+    candidates = []
+    for xpath in [
+        "//button[normalize-space(.)='0 kr']",
+        "//*[@role='button' and normalize-space(.)='0 kr']",
+        "//a[normalize-space(.)='0 kr']",
+    ]:
+        try:
+            candidates.extend(driver.find_elements(By.XPATH, xpath))
+        except Exception:
+            pass
+
+    # Deduplicate while preserving order.
+    seen = set()
+    usable = []
+    for el in candidates:
+        try:
+            key = el.id
+        except Exception:
+            key = id(el)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if el.is_displayed() and _element_is_enabled(el):
+                usable.append(el)
+        except Exception:
+            pass
+
+    if not usable:
+        # ICA may wrap the text in a child element. Find visible 0 kr nodes and
+        # walk up to a clickable parent, while rejecting disabled cells.
+        try:
+            zero_nodes = driver.find_elements(
+                By.XPATH,
+                "//*[normalize-space(.)='0 kr']",
+            )
+        except Exception:
+            zero_nodes = []
+
+        for node in zero_nodes:
+            try:
+                if not node.is_displayed():
+                    continue
+                clickable = driver.execute_script(
+                    """
+                    let e = arguments[0];
+                    for (let i=0; i<5 && e; i++, e=e.parentElement) {
+                        const role=(e.getAttribute('role')||'').toLowerCase();
+                        if (e.tagName==='BUTTON' || e.tagName==='A' || role==='button') return e;
+                    }
+                    return null;
+                    """,
+                    node,
+                )
+                if clickable and clickable.is_displayed() and _element_is_enabled(clickable):
+                    usable.append(clickable)
+            except Exception:
+                pass
+
+    if not usable:
+        return False
+
+    if click_first(driver, usable):
+        print("         🕒 Valde första lediga hämtningstid")
+        time.sleep(1.2)
+        return True
+    return False
+
+
+def continue_after_slot_if_needed(driver):
+    """Continue from delivery selection, but never click purchase/payment buttons."""
+    safe_labels = [
+        "fortsätt",
+        "gå vidare",
+        "till kundvagn",
+        "till varukorg",
+        "till kassan",
+    ]
+    dangerous = ["beställ", "slutför", "betala", "bekräfta köp"]
+
+    for label in safe_labels:
+        xpath = (
+            "//*[self::button or self::a][contains(translate(normalize-space(.),"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),"
+            f"'{label}')]"
+        )
+        for el in visible_elements(driver, xpath):
+            try:
+                txt = fold_text((el.text or '') + ' ' + (el.get_attribute('aria-label') or ''))
+                if any(x in txt for x in dangerous):
+                    continue
+                driver.execute_script("arguments[0].click();", el)
+                time.sleep(1.0)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def ensure_pickup_slot(driver):
+    """
+    Make sure ICA has a pickup location + pickup time selected.
+
+    This handles the exact flow shown by ICA:
+      1. choose Hämta
+      2. choose the pickup location in the modal
+      3. choose the first enabled 0 kr pickup slot
+    """
+    for _ in range(5):
+        text = fold_text(page_text(driver))
+        url = driver.current_url.lower()
+
+        changed = False
+
+        if "valj utlamningsstalle" in text or "valj den har platsen" in text:
+            changed = choose_pickup_location_if_needed(driver) or changed
+            if changed:
+                continue
+
+        if "valj leveranstid" in text or "/delivery/" in url or "/slots" in url:
+            # Always force pickup when this page is shown.
+            if "hamta" in text:
+                changed = choose_pickup_tab(driver) or changed
+                time.sleep(0.4)
+
+            # Choosing Hämta can open the pickup-location modal.
+            if choose_pickup_location_if_needed(driver):
+                changed = True
+                time.sleep(0.5)
+
+            # Make sure the tab is still Hämta after the modal closes.
+            text = fold_text(page_text(driver))
+            if "valj leveranstid" in text and "hamta" in text:
+                choose_pickup_tab(driver)
+
+            if choose_first_available_pickup_slot(driver):
+                changed = True
+                continue_after_slot_if_needed(driver)
+                time.sleep(0.8)
+
+                # A selected slot normally removes us from the slot chooser or
+                # changes the page so that the cart/checkout can be inspected.
+                new_text = fold_text(page_text(driver))
+                if "valj leveranstid" not in new_text:
+                    return True, "Hämta + hämtningstid vald"
+
+                # Even if the heading remains, ICA may already have stored the slot.
+                if "se lediga leveranstider" in new_text or "varukorg" in new_text or "kassa" in new_text:
+                    return True, "Hämta + hämtningstid vald"
+
+        if not changed:
+            break
+
+    # If we're no longer on the delivery selector, consider it successful.
+    final_text = fold_text(page_text(driver))
+    final_url = driver.current_url.lower()
+    if "valj leveranstid" not in final_text and "/delivery/collection/slots" not in final_url:
+        return True, "Leveransval redan klart"
+
+    return False, "Kunde inte välja Hämta + hämtningstid"
+
+
 def open_cart_or_checkout(driver):
     """
-    Öppna kundvagn/kassa utan att någonsin klicka på en knapp som slutför köp.
+    Open cart/checkout and finish ICA's pickup-time selection when required.
+    Never clicks a purchase/payment confirmation button.
     """
     candidates = visible_elements(
         driver,
@@ -851,42 +1100,42 @@ def open_cart_or_checkout(driver):
         ),
     )
 
-    if click_first(driver, candidates):
+    opened = click_first(driver, candidates)
+
+    if not opened:
+        text_candidates = visible_elements(
+            driver,
+            (
+                "//*[self::a or self::button]["
+                "contains(translate(normalize-space(.),"
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'kundvagn') "
+                "or contains(translate(normalize-space(.),"
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'varukorg') "
+                "or contains(translate(normalize-space(.),"
+                "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'kassa')]"
+            ),
+        )
+        opened = click_first(driver, text_candidates)
+
+    if opened:
         time.sleep(1.2)
+        ok, note = ensure_pickup_slot(driver)
+        if not ok:
+            return False
         return True
 
-    text_candidates = visible_elements(
-        driver,
-        (
-            "//*[self::a or self::button]["
-            "contains(translate(normalize-space(.),"
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'kundvagn') "
-            "or contains(translate(normalize-space(.),"
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'varukorg') "
-            "or contains(translate(normalize-space(.),"
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZÅÄÖ','abcdefghijklmnopqrstuvwxyzåäö'),'kassa')]"
-        ),
-    )
-
-    if click_first(driver, text_candidates):
-        time.sleep(1.2)
-        return True
-
-    # Vanliga direkta fallback-URL:er.
+    # Direct fallbacks.
     current = driver.current_url
     base_match = re.match(r"(https://handlaprivatkund\.ica\.se/stores/\d+)", current)
-
     fallback_urls = []
 
     if base_match:
         base = base_match.group(1)
-        fallback_urls.extend(
-            [
-                f"{base}/cart",
-                f"{base}/basket",
-                f"{base}/checkout",
-            ]
-        )
+        fallback_urls.extend([
+            f"{base}/cart",
+            f"{base}/basket",
+            f"{base}/checkout",
+        ])
 
     for url in fallback_urls:
         try:
@@ -899,13 +1148,15 @@ def open_cart_or_checkout(driver):
                 or "varukorg" in text
                 or "kassa" in text
                 or "bestallning" in text
+                or "valj leveranstid" in text
             ):
-                return True
+                ok, note = ensure_pickup_slot(driver)
+                if ok:
+                    return True
         except Exception:
             pass
 
     return False
-
 
 def product_name_matches(haystack, product_name):
     """
@@ -1166,13 +1417,15 @@ def verify_product_via_checkout(driver, row):
 
 def verify_store_rows(driver, tcg_rows, only_search_in_stock=True):
     """
-    Kontrollera TCG-rader i kassan. Som standard verifieras bara produkter
-    som söksidan först markerar som i lager. Det sparar mycket tid.
+    Kontrollera TCG-rader i kassan. Som standard verifieras produkter som
+    söksidan visar som JA eller OKÄNT; endast tydligt NEJ hoppas över.
     """
     candidates = []
 
     for row in tcg_rows:
-        if only_search_in_stock and row.get("search_stock") is not True:
+        # Kassakontrollen behövs särskilt för OKÄNT. Hoppa bara över produkter
+        # som söksidan redan uttryckligen visar som slut när standardläget används.
+        if only_search_in_stock and row.get("search_stock") is False:
             continue
         candidates.append(row)
 
@@ -1362,12 +1615,26 @@ def main():
 
         if args.store:
             needle = fold_text(args.store)
-            stores = [
+
+            # Prefer exact city/store matches. This makes --store Mora select
+            # Mora without also matching Moraberg in Södertälje.
+            exact = [
                 s
                 for s in stores
-                if needle in fold_text(s["name"])
-                or needle in fold_text(s.get("city", ""))
+                if fold_text(s["name"]) == needle
+                or fold_text(s.get("city", "")) == needle
+                or fold_text(s["name"]).endswith(" " + needle)
             ]
+
+            if exact:
+                stores = exact
+            else:
+                stores = [
+                    s
+                    for s in stores
+                    if needle in fold_text(s["name"])
+                    or needle in fold_text(s.get("city", ""))
+                ]
 
         print(f"\nHittade {len(stores)} Maxi-butiker att kontrollera.")
 

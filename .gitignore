@@ -50,3 +50,5 @@ selenium-profile/
 output/
 exports/
 data/
+# ICA Chrome profile
+ica_chrome_profile/
