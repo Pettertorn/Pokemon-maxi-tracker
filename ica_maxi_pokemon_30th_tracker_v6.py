@@ -26,7 +26,7 @@ ICA_PROFILE_DIR = SCRIPT_DIR / "ica_chrome_profile"
 
 # Kassakontrollen lägger aldrig någon beställning. Den går bara så långt
 # att ICA kan visa om en vara är tillgänglig för vald butik/tid.
-CHECKOUT_VERIFY = True
+CHECKOUT_VERIFY = False
 
 
 def normalize_space(text):
@@ -1086,6 +1086,46 @@ def ensure_pickup_slot(driver):
     return False, "Kunde inte välja Hämta + hämtningstid"
 
 
+
+def prepare_store_pickup(driver, store):
+    """
+    Välj Hämta + utlämningsställe + första lediga hämtningstid INNAN
+    produktsökningen körs.
+
+    ICA filtrerar därefter butikens sortiment/lager mot den valda tiden,
+    vilket gör att produkter som inte går att beställa för tidsluckan kan
+    försvinna redan från sökresultatet.
+    """
+    store_id = store["store_id"]
+
+    slots_url = (
+        f"{SHOP_BASE}/stores/{store_id}/delivery/collection/slots"
+        "?in-checkout-walk=true&shippingGroup=default+home+delivery"
+    )
+
+    print("    Förbereder Hämta + hämtningstid...")
+
+    driver.get(slots_url)
+
+    try:
+        WebDriverWait(driver, WAIT_SECONDS).until(
+            lambda d: len(d.find_elements(By.TAG_NAME, "body")) > 0
+        )
+    except Exception:
+        pass
+
+    time.sleep(1.0)
+    accept_cookies_if_present(driver)
+
+    ok, note = ensure_pickup_slot(driver)
+
+    if ok:
+        print(f"    ✅ {note}")
+        return True
+
+    print(f"    ⚠️ {note}")
+    return False
+
 def open_cart_or_checkout(driver):
     """
     Open cart/checkout and finish ICA's pickup-time selection when required.
@@ -1548,8 +1588,8 @@ def unique_output_names():
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Sök igenom Maxi ICA efter Pokémon TCG och verifiera lager "
-            "via ICA:s kundvagn/kassa."
+            "Sök igenom Maxi ICA efter Pokémon TCG efter att Hämta och "
+            "hämtningstid valts för varje butik."
         )
     )
 
@@ -1560,9 +1600,13 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--no-checkout",
+        "--checkout",
         action="store_true",
-        help="Hoppa över den extra lagerkontrollen i kundvagn/kassa.",
+        help=(
+            "Gör även den långsamma extra kontrollen produkt för produkt "
+            "i kundvagn/kassa. Normalt behövs den inte eftersom Hämta + "
+            "hämtningstid väljs före produktsökningen."
+        ),
     )
 
     parser.add_argument(
@@ -1641,12 +1685,12 @@ def main():
         if not args.store and len(stores) < 70:
             print("VARNING: butiklistan verkar ofullständig.")
 
-        checkout_verify = CHECKOUT_VERIFY and not args.no_checkout
+        checkout_verify = CHECKOUT_VERIFY or args.checkout
 
         if checkout_verify:
-            print("Extra kassakontroll: PÅ")
+            print("Extra kassakontroll produkt-för-produkt: PÅ")
         else:
-            print("Extra kassakontroll: AV")
+            print("Extra kassakontroll produkt-för-produkt: AV (pickup-filter används)")
 
         all_rows = []
         all_30th = []
@@ -1660,6 +1704,26 @@ def main():
             )
 
             try:
+                # Viktig ordning:
+                # 1. välj Hämta + hämtningstid
+                # 2. sök därefter efter Pokémon
+                #
+                # ICA uppdaterar/filtrerar sortimentet mot vald tidslucka.
+                pickup_ok = prepare_store_pickup(driver, store)
+
+                if not pickup_ok:
+                    failures.append(
+                        (
+                            store["name"],
+                            "Kunde inte välja Hämta + hämtningstid",
+                        )
+                    )
+                    print(
+                        "    ! Hoppar över butiken eftersom lager inte kan "
+                        "kontrolleras mot en vald hämtningstid."
+                    )
+                    continue
+
                 url = search_url(store["store_id"])
                 driver.get(url)
                 wait_for_search_page(driver)
@@ -1690,6 +1754,11 @@ def main():
                     for row in deduped
                     if looks_like_tcg(row["product"])
                 ]
+
+                # Eftersom Hämta + tid redan är vald är detta nu butikens
+                # sökresultat för just den valda hämtningstiden.
+                for row in tcg_rows:
+                    row["checkout_note"] = "Hämta + hämtningstid vald före sökning"
 
                 if checkout_verify:
                     verify_store_rows(
@@ -1805,7 +1874,7 @@ def main():
         )
 
         if checkout_verify:
-            print(f"Kassaverifierade rader: {checkout_checked}")
+            print(f"Extra kassaverifierade rader: {checkout_checked}")
             print(f"Kassan ändrade till slut/ej tillgänglig: {checkout_out}")
 
         print(f"Sparat: {out_all}")
