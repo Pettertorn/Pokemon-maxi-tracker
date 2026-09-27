@@ -1,3 +1,5 @@
+Currently not working, will fix when I have time.
+
 # Pokémon Maxi Tracker
 
 Ett Python-script som söker igenom **Maxi ICA Stormarknads onlinebutiker** efter Pokémon TCG-produkter.
